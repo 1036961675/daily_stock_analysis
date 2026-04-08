@@ -15,7 +15,16 @@
 --   2) 对新增价格进行归因分类 (零件新增/升版/供应商切换/工厂切换/价格变更)
 --   3) 匹配变更来源 (被替代的前一版价格)
 --   4) 按价格有效月份展开 (explode)
---   5) 合并入结果表 (已有记录 + 新增记录, 并更新消失价格的void_date)
+--   5) 合并入结果表 (已有记录 + 新增记录, 并通过接替关系计算void_date)
+--
+-- SOURCING_ADD 处理:
+--   非正式价(price_source='SOURCING_ADD')按 业务件+区间 去重,
+--   全历史仅首次出现时写入日志; 后续快照重复出现则忽略。
+--
+-- price_void_date(接替关系):
+--   同一业务分组下, 后续记录出现时, 前序记录被接替;
+--   正式价从快照消失时, 亦视为消失(void_date = 消失日期)。
+--   接替排序键: effect_date ASC, gps_create_time ASC, gps_price_confirm_no ASC
 -- =====================================================================
 
 INSERT OVERWRITE TABLE dwd.disc_nio_dp_price_change_log
@@ -26,7 +35,6 @@ WITH
 -- 第一步: 数据准备 - 获取今日快照 & 前一快照
 -- =============================================================
 
--- 前一快照日期: 在最近4天范围内取最新的一天
 prev_dt AS (
     SELECT COALESCE(MAX(datetime), '1970-01-01') AS dt
     FROM dwd.disc_nio_dp_price_price_1d_f
@@ -34,7 +42,6 @@ prev_dt AS (
       AND datetime <= '$[yyyy-MM-dd-1]'
 ),
 
--- 当日快照(解析物料号组件)
 curr AS (
     SELECT
         gps_price_confirm_no,
@@ -45,9 +52,9 @@ curr AS (
         SUBSTR(effect_time, 1, 10)          AS effect_date,
         SUBSTR(expire_time, 1, 10)          AS expire_date,
         create_time                         AS gps_create_time,
+        price_source,
         CAST(material_price_amount  AS DECIMAL(20,4)) AS material_price_amount,
         CAST(logistic_price_amount  AS DECIMAL(20,4)) AS logistic_price_amount,
-        -- 物料号拆解: 前缀8位 + 颜色5位(可选) + 版本2位
         SUBSTR(material_code, 1, 8)         AS part_prefix,
         CASE WHEN LENGTH(material_code) > 10
              THEN SUBSTR(material_code, 9, LENGTH(material_code) - 10)
@@ -58,7 +65,6 @@ curr AS (
       AND SUBSTR(effect_time, 1, 10) >= '2025-01-01'
 ),
 
--- 前一快照(同样解析)
 prev AS (
     SELECT
         gps_price_confirm_no,
@@ -69,6 +75,7 @@ prev AS (
         SUBSTR(effect_time, 1, 10)          AS effect_date,
         SUBSTR(expire_time, 1, 10)          AS expire_date,
         create_time                         AS gps_create_time,
+        price_source,
         CAST(material_price_amount  AS DECIMAL(20,4)) AS material_price_amount,
         CAST(logistic_price_amount  AS DECIMAL(20,4)) AS logistic_price_amount,
         SUBSTR(material_code, 1, 8)         AS part_prefix,
@@ -85,8 +92,7 @@ prev AS (
 -- 第二步: 变动检测 - 识别新增 & 消失价格
 -- =============================================================
 
--- 新增价格: 今日有, 前一快照没有
-new_prices AS (
+new_prices_raw AS (
     SELECT c.*
     FROM curr c
     WHERE NOT EXISTS (
@@ -95,7 +101,26 @@ new_prices AS (
     )
 ),
 
--- 消失价格: 前一快照有, 今日没有
+-- SOURCING_ADD 去重: 排除已存在于日志中的 业务件+区间 组合
+new_prices AS (
+    SELECT n.*
+    FROM new_prices_raw n
+    WHERE NOT (
+        n.price_source = 'SOURCING_ADD'
+        AND EXISTS (
+            SELECT 1
+            FROM dwd.disc_nio_dp_price_change_log el
+            WHERE el.vendor_code   = n.vendor_code
+              AND el.factory_code  = n.factory_code
+              AND el.material_code = n.material_code
+              AND el.supply_status = n.supply_status
+              AND el.effect_date   = n.effect_date
+              AND el.expire_date   = n.expire_date
+              AND el.price_source  = 'SOURCING_ADD'
+        )
+    )
+),
+
 void_ids AS (
     SELECT p.gps_price_confirm_no
     FROM prev p
@@ -109,7 +134,6 @@ void_ids AS (
 -- 第三步: 变更归因 - 基于前一快照维度聚合判断变更类型
 -- =============================================================
 
--- 维度1: 零件组 (prefix + color + supply_status) → 用于判断 零件新增/零件升版
 prev_part_versions AS (
     SELECT
         part_prefix, part_color, supply_status,
@@ -118,7 +142,6 @@ prev_part_versions AS (
     GROUP BY part_prefix, part_color, supply_status
 ),
 
--- 维度2: 供应商组 (prefix + color + version + supply_status) → 用于判断 供应商切换
 prev_vendor_set AS (
     SELECT
         part_prefix, part_color, part_version, supply_status,
@@ -127,7 +150,6 @@ prev_vendor_set AS (
     GROUP BY part_prefix, part_color, part_version, supply_status
 ),
 
--- 维度3: 工厂组 (prefix + color + version + vendor) → 用于判断 工厂切换
 prev_factory_set AS (
     SELECT
         part_prefix, part_color, part_version, vendor_code,
@@ -136,46 +158,39 @@ prev_factory_set AS (
     GROUP BY part_prefix, part_color, part_version, vendor_code
 ),
 
--- 维度4: 价格组 (prefix + color + factory + vendor + supply_status) 最新一条 → 用于判断 价格变更
 prev_price_ranked AS (
     SELECT *,
         ROW_NUMBER() OVER (
             PARTITION BY part_prefix, part_color, factory_code, vendor_code, supply_status
-            ORDER BY gps_create_time DESC, expire_date DESC
+            ORDER BY effect_date DESC, gps_create_time DESC, gps_price_confirm_no DESC
         ) AS rn
     FROM prev
 ),
 
--- 新增价格归因分类
 new_classified AS (
     SELECT
         n.*,
 
-        -- ① 零件新增: (prefix, color, supply_status) 在前一快照不存在
         CASE WHEN pv.part_prefix IS NULL
              THEN 1 ELSE 0
         END AS is_part_new,
 
-        -- ② 零件升版: 当前版本不在前一快照版本集合中, 但存在更早版本
         CASE WHEN pv.part_prefix IS NOT NULL
                   AND NOT ARRAY_CONTAINS(pv.version_set, n.part_version)
                   AND SIZE(FILTER(pv.version_set, v -> v < n.part_version)) > 0
              THEN 1 ELSE 0
         END AS is_version_upgrade,
 
-        -- ③ 供应商切换: (prefix, color, version, supply_status) 有供应商但无当前供应商
         CASE WHEN vs.part_prefix IS NOT NULL
                   AND NOT ARRAY_CONTAINS(vs.vendor_set, n.vendor_code)
              THEN 1 ELSE 0
         END AS is_vendor_switch,
 
-        -- ④ 工厂切换: (prefix, color, version, vendor) 有工厂但无当前工厂
         CASE WHEN fs.part_prefix IS NOT NULL
                   AND NOT ARRAY_CONTAINS(fs.factory_set, n.factory_code)
              THEN 1 ELSE 0
         END AS is_factory_switch,
 
-        -- ⑤ 价格变更: (prefix, color, factory, vendor, supply_status) 最新价格与当前不同
         CASE WHEN pr.part_prefix IS NOT NULL
                   AND (COALESCE(pr.material_price_amount, 0) != COALESCE(n.material_price_amount, 0)
                     OR COALESCE(pr.logistic_price_amount, 0) != COALESCE(n.logistic_price_amount, 0))
@@ -184,27 +199,23 @@ new_classified AS (
 
     FROM new_prices n
 
-    -- 零件新增 / 零件升版
     LEFT JOIN prev_part_versions pv
         ON  n.part_prefix   = pv.part_prefix
         AND n.part_color    = pv.part_color
         AND n.supply_status = pv.supply_status
 
-    -- 供应商切换
     LEFT JOIN prev_vendor_set vs
         ON  n.part_prefix   = vs.part_prefix
         AND n.part_color    = vs.part_color
         AND n.part_version  = vs.part_version
         AND n.supply_status = vs.supply_status
 
-    -- 工厂切换
     LEFT JOIN prev_factory_set fs
         ON  n.part_prefix   = fs.part_prefix
         AND n.part_color    = fs.part_color
         AND n.part_version  = fs.part_version
         AND n.vendor_code   = fs.vendor_code
 
-    -- 价格变更 (取前一快照同组最新价格)
     LEFT JOIN prev_price_ranked pr
         ON  n.part_prefix   = pr.part_prefix
         AND n.part_color    = pr.part_color
@@ -217,8 +228,6 @@ new_classified AS (
 -- =============================================================
 -- 第四步: 变更来源匹配 - 找到被替代/对比的前一版价格
 -- =============================================================
-
--- 候选来源: 按优先级在前一快照中匹配
 -- 优先级:
 --   1. 同(prefix+color+factory+vendor+supply) → 价格变更来源
 --   2. 同(prefix+color+version+vendor)不同factory → 工厂切换来源
@@ -243,8 +252,9 @@ change_source_ranked AS (
                      AND p.supply_status = n.supply_status THEN 3
                     ELSE 4
                 END,
+                p.effect_date     DESC,
                 p.gps_create_time DESC,
-                p.expire_date     DESC
+                p.gps_price_confirm_no DESC
         ) AS rn
     FROM new_classified n
     JOIN prev p
@@ -268,6 +278,7 @@ best_source AS (
 -- =============================================================
 -- 第五步: 月份展开 - 按价格有效期逐月展开
 -- =============================================================
+-- 边界规则: 首尾月均包含(闭-闭), 基于 SEQUENCE 按自然月生成
 
 new_exploded AS (
     SELECT
@@ -277,10 +288,14 @@ new_exploded AS (
         nc.factory_code,
         nc.supply_status,
         DATE_FORMAT(m, 'yyyy-MM')           AS effect_month,
+        nc.effect_date,
+        nc.expire_date,
         '$[yyyy-MM-dd]'                     AS price_create_date,
         CAST(NULL AS STRING)                AS price_void_date,
         nc.gps_create_time,
-        -- 构建归因数组(过滤掉NULL)
+        nc.price_source,
+        nc.material_price_amount,
+        nc.logistic_price_amount,
         FILTER(ARRAY(
             IF(nc.is_part_new        = 1, '零件新增',   NULL),
             IF(nc.is_version_upgrade = 1, '零件升版',   NULL),
@@ -301,12 +316,122 @@ new_exploded AS (
     ) months AS m
     LEFT JOIN best_source bs
         ON nc.gps_price_confirm_no = bs.gps_price_confirm_no
+),
+
+-- =============================================================
+-- 第六步: 无归因命中时补充"价格续期"
+-- =============================================================
+
+new_with_fallback AS (
+    SELECT
+        ne.gps_price_confirm_no,
+        ne.material_code,
+        ne.vendor_code,
+        ne.factory_code,
+        ne.supply_status,
+        ne.effect_month,
+        ne.effect_date,
+        ne.expire_date,
+        ne.price_create_date,
+        ne.price_void_date,
+        ne.gps_create_time,
+        ne.price_source,
+        ne.material_price_amount,
+        ne.logistic_price_amount,
+        CASE WHEN SIZE(ne.change_reason) = 0
+             THEN ARRAY('价格续期')
+             ELSE ne.change_reason
+        END                                 AS change_reason,
+        ne.change_source_price_confirm_no,
+        ne.change_source_pricea,
+        ne.change_source_priceb
+    FROM new_exploded ne
+),
+
+-- =============================================================
+-- 第七步: 接替式 void_date 计算
+-- =============================================================
+-- 同一业务分组(material_code + factory_code + vendor_code + supply_status)下,
+-- 按排序键(effect_date ASC, gps_create_time ASC, gps_price_confirm_no ASC),
+-- 后一条记录的 price_create_date 即为前一条的 void_date。
+-- 同时, 正式价从快照消失(void_ids)也需标记 void_date。
+
+existing_updated AS (
+    SELECT
+        log.gps_price_confirm_no,
+        log.material_code,
+        log.vendor_code,
+        log.factory_code,
+        log.supply_status,
+        log.effect_month,
+        log.effect_date,
+        log.expire_date,
+        log.price_create_date,
+        COALESCE(
+            log.price_void_date,
+            CASE WHEN vi.gps_price_confirm_no IS NOT NULL THEN '$[yyyy-MM-dd]' END
+        ) AS price_void_date,
+        log.gps_create_time,
+        log.price_source,
+        log.material_price_amount,
+        log.logistic_price_amount,
+        log.change_reason,
+        log.change_source_price_confirm_no,
+        log.change_source_pricea,
+        log.change_source_priceb
+    FROM dwd.disc_nio_dp_price_change_log log
+    LEFT JOIN void_ids vi
+        ON log.gps_price_confirm_no = vi.gps_price_confirm_no
+),
+
+-- 合并已有记录与新增记录, 然后用窗口函数计算接替 void_date
+all_records AS (
+    SELECT * FROM existing_updated
+
+    UNION ALL
+
+    SELECT
+        ne.gps_price_confirm_no,
+        ne.material_code,
+        ne.vendor_code,
+        ne.factory_code,
+        ne.supply_status,
+        ne.effect_month,
+        ne.effect_date,
+        ne.expire_date,
+        ne.price_create_date,
+        ne.price_void_date,
+        ne.gps_create_time,
+        ne.price_source,
+        ne.material_price_amount,
+        ne.logistic_price_amount,
+        ne.change_reason,
+        ne.change_source_price_confirm_no,
+        ne.change_source_pricea,
+        ne.change_source_priceb
+    FROM new_with_fallback ne
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM dwd.disc_nio_dp_price_change_log el
+        WHERE el.gps_price_confirm_no = ne.gps_price_confirm_no
+          AND el.effect_month         = ne.effect_month
+    )
+),
+
+-- 在业务分组+月份维度内, 用 LEAD 窗口获取下一条记录的 price_create_date 作为接替日期
+with_succession AS (
+    SELECT
+        ar.*,
+        LEAD(ar.price_create_date) OVER (
+            PARTITION BY ar.material_code, ar.factory_code, ar.vendor_code,
+                         ar.supply_status, ar.effect_month
+            ORDER BY ar.effect_date ASC, ar.gps_create_time ASC, ar.gps_price_confirm_no ASC
+        ) AS successor_create_date
+    FROM all_records ar
 )
 
 -- =============================================================
--- 第六步: 最终合并 → INSERT OVERWRITE
---   Part A: 已有日志 (更新消失价格的void_date)
---   Part B: 新增展开记录 (去重保障幂等)
+-- 最终输出: 如果当前记录无 void_date 但有后继记录, 用后继的 price_create_date 作为 void_date
 -- =============================================================
 
 SELECT
@@ -316,61 +441,19 @@ SELECT
     factory_code,
     supply_status,
     effect_month,
+    effect_date,
+    expire_date,
     price_create_date,
-    price_void_date,
+    COALESCE(price_void_date, successor_create_date) AS price_void_date,
     gps_create_time,
+    price_source,
+    material_price_amount,
+    logistic_price_amount,
     change_reason,
     change_source_price_confirm_no,
     change_source_pricea,
     change_source_priceb
-FROM (
-    -- Part A: 已有日志记录 (消失价格写入void_date, 已有void_date保持不变)
-    SELECT
-        log.gps_price_confirm_no,
-        log.material_code,
-        log.vendor_code,
-        log.factory_code,
-        log.supply_status,
-        log.effect_month,
-        log.price_create_date,
-        COALESCE(
-            log.price_void_date,
-            CASE WHEN vi.gps_price_confirm_no IS NOT NULL THEN '$[yyyy-MM-dd]' END
-        ) AS price_void_date,
-        log.gps_create_time,
-        log.change_reason,
-        log.change_source_price_confirm_no,
-        log.change_source_pricea,
-        log.change_source_priceb
-    FROM dwd.disc_nio_dp_price_change_log log
-    LEFT JOIN void_ids vi
-        ON log.gps_price_confirm_no = vi.gps_price_confirm_no
-
-    UNION ALL
-
-    -- Part B: 新增展开记录 (排除已存在于日志中的记录, 保障重跑幂等)
-    SELECT
-        ne.gps_price_confirm_no,
-        ne.material_code,
-        ne.vendor_code,
-        ne.factory_code,
-        ne.supply_status,
-        ne.effect_month,
-        ne.price_create_date,
-        ne.price_void_date,
-        ne.gps_create_time,
-        ne.change_reason,
-        ne.change_source_price_confirm_no,
-        ne.change_source_pricea,
-        ne.change_source_priceb
-    FROM new_exploded ne
-    WHERE NOT EXISTS (
-        SELECT 1
-        FROM dwd.disc_nio_dp_price_change_log el
-        WHERE el.gps_price_confirm_no = ne.gps_price_confirm_no
-          AND el.effect_month         = ne.effect_month
-    )
-) combined
+FROM with_succession
 ;
 
 
