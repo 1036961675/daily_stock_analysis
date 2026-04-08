@@ -1,41 +1,25 @@
 -- =====================================================================
--- 价格变动日志 - 首次全量初始化
+-- 价格变动日志 - 初始化说明
 -- =====================================================================
--- 说明: 选择一个基准日快照, 将所有价格全量插入日志表, 统一归因为"零件新增"
--- 使用: 修改下方 @init_date 为你选定的基准日期(该日期需有完整快照数据)
--- 运行完毕后, 从基准日+1开始每日调度 price_change_log_etl.sql
+--
+-- 新架构下不再需要单独的初始化脚本。
+--
+-- 原因:
+--   每日 ETL 完全独立, 只做 T vs T-1 比对, 按 snapshot_date 分区写入。
+--   INSERT OVERWRITE PARTITION 天然幂等, 重跑安全。
+--   不存在需要"种子数据"的场景。
+--
+-- 运行方式:
+--   1. 执行 price_change_log_ddl.sql 建表
+--   2. 直接调度 price_change_log_etl.sql (每日)
+--      - 首日运行时如果 T-1 快照不存在, 所有当日价格均判定为"新增"
+--      - 次日开始即为正常 T vs T-1 比对
+--
+-- 如需补跑历史:
+--   依次将 $[yyyy-MM-dd] 设为历史各日期运行 ETL 即可,
+--   各分区独立, 不互相影响。
+--
+-- 示例 (Spark SQL 参数化):
+--   spark-sql -e "SET yyyy-MM-dd=2025-01-03; SET yyyy-MM-dd-1=2025-01-02; ..."
+--   或通过调度系统参数自动填充。
 -- =====================================================================
-
--- SET @init_date = '2025-01-02'; -- 按实际情况修改
-
-INSERT OVERWRITE TABLE dwd.disc_nio_dp_price_change_log
-SELECT
-    a.gps_price_confirm_no,
-    a.material_code,
-    a.gps_vendor_code                       AS vendor_code,
-    a.factory_code,
-    a.supply_status,
-    DATE_FORMAT(m, 'yyyy-MM')               AS effect_month,
-    SUBSTR(a.effect_time, 1, 10)            AS effect_date,
-    SUBSTR(a.expire_time, 1, 10)            AS expire_date,
-    a.datetime                              AS price_create_date,
-    CAST(NULL AS STRING)                    AS price_void_date,
-    a.create_time                           AS gps_create_time,
-    a.price_source,
-    CAST(a.material_price_amount AS DECIMAL(20,4))  AS material_price_amount,
-    CAST(a.logistic_price_amount AS DECIMAL(20,4))  AS logistic_price_amount,
-    ARRAY('零件新增')                        AS change_reason,
-    CAST(NULL AS STRING)                    AS change_source_price_confirm_no,
-    CAST(NULL AS STRING)                    AS change_source_pricea,
-    CAST(NULL AS STRING)                    AS change_source_priceb
-FROM dwd.disc_nio_dp_price_price_1d_f a
-LATERAL VIEW EXPLODE(
-    SEQUENCE(
-        CAST(CONCAT(SUBSTR(SUBSTR(a.effect_time,1,10), 1, 7), '-01') AS DATE),
-        CAST(CONCAT(SUBSTR(SUBSTR(a.expire_time,1,10), 1, 7), '-01') AS DATE),
-        INTERVAL 1 MONTH
-    )
-) months AS m
-WHERE a.datetime = '${init_date}'
-  AND SUBSTR(a.effect_time, 1, 10) >= '2025-01-01'
-;
